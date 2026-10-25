@@ -1,0 +1,37 @@
+
+# Build directories
+/build/
+/build-*/
+/out/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+
+# Ninja
+build.ninja
+.ninja_deps
+.ninja_log
+
+# Compiler output
+*.o
+*.obj
+*.a
+*.d
+*.su
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
