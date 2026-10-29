@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 #define UI2C_VERSION_MAJOR 1
-#define UI2C_VERSION_MINOR 0
+#define UI2C_VERSION_MINOR 1
 
 /**
  * @brief Opaque I2C bus handle.
@@ -72,9 +72,10 @@ enum {
  */
 typedef struct {
     union {
-        const uint8_t* tx; /**< Source buffer for write operations. */
-        uint8_t* rx;       /**< Destination buffer for read operations. */
-    } data;                /**< Message data buffer. */
+        const uint8_t* tx;   /**< Source buffer for ordinary writes. */
+        uint8_t* tx_mutable; /**< Writable data buffer for prepared writes. */
+        uint8_t* rx;         /**< Destination buffer for read operations. */
+    } data;                  /**< Message data buffer. */
 
     size_t len;     /**< Number of bytes to transfer. */
     uint16_t flags; /**< Message direction and control flags. */
@@ -88,10 +89,11 @@ typedef struct {
  * used to validate requested transactions.
  */
 enum {
-    UI2C_CAP_RESTART = 1U << 0,    /**< Repeated START between messages. */
-    UI2C_CAP_CONTINUE = 1U << 1,   /**< Continue without START or STOP. */
-    UI2C_CAP_PROBE = 1U << 2,      /**< Zero-length write (address-only probe). */
-    UI2C_CAP_ADDR_10BIT = 1U << 3, /**< 10-bit address support. */
+    UI2C_CAP_RESTART = 1U << 0,       /**< Repeated START between messages. */
+    UI2C_CAP_CONTINUE = 1U << 1,      /**< Continue without START or STOP. */
+    UI2C_CAP_PROBE = 1U << 2,         /**< Zero-length write (address-only probe). */
+    UI2C_CAP_ADDR_10BIT = 1U << 3,    /**< 10-bit address support. */
+    UI2C_CAP_PREPARED_XFER = 1U << 4, /**< Read -> repeated-START -> prepared write support. */
 };
 
 /**
@@ -110,6 +112,20 @@ enum {
 typedef uint32_t (*ui2c_time_ms_t)(void* arg);
 
 typedef void (*ui2c_callback_t)(ui2c_t* bus, ui2c_status_t status, void* arg);
+
+/* Bounded, ISR-safe transformation between two phases of ONE transfer.
+ * Never call the public ui2c API, sleep, allocate or access hardware here.
+ * RX is complete; TX is a distinct, writable caller-owned buffer. The port
+ * already armed a repeated START and still owns the bus at this instant.
+ * Return non-OK to abort the entire transfer; no hidden retry. */
+typedef ui2c_status_t (*ui2c_prepare_fn_t)(const uint8_t* rx, size_t rx_len, uint8_t* tx, size_t tx_len, void* arg);
+
+typedef struct {
+    ui2c_prepare_fn_t fn;
+    void* arg;
+    size_t read_index;  /* A completed READ message. */
+    size_t write_index; /* Later WRITE message with writable data.tx_mutable. */
+} ui2c_prepare_t;
 
 /** Monotonic wrapping millisecond clock. timeout_ms is mandatory, 1..INT32_MAX.
  * Clock must run during a request. Service process at least once per timer wrap.
@@ -142,6 +158,16 @@ ui2c_status_t ui2c_xfer(ui2c_t* bus, ui2c_addr_t addr, const ui2c_msg_t* msgs, s
 
 /** Synchronously quiesce local hardware; callback remains deferred to process.
  * Already-completed result wins. No GPIO recovery: target may still hold SDA. */
+/* Like ui2c_xfer, but the port invokes prepare.fn exactly once in IRQ
+ * context after the nominated READ and before sending the nominated WRITE.
+ * The port MUST keep the bus without STOP (repeated START). No callback
+ * before completion; no STOP-separated fallback. The prepare descriptor is
+ * copied, but read/write buffers and prepare.arg must outlive completion.
+ * Only backends advertising UI2C_CAP_PREPARED_XFER support this operation.
+ * Specific supported bus message patterns are backend-dependent. */
+ui2c_status_t ui2c_xfer_prepared(ui2c_t* bus, ui2c_addr_t addr, const ui2c_msg_t* msgs, size_t count,
+                                 const ui2c_prepare_t* prepare, ui2c_callback_t callback, void* arg);
+
 ui2c_status_t ui2c_cancel(ui2c_t* bus);
 
 /** Advance the backend, detect timeout and dispatch at most one callback.

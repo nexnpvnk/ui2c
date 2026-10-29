@@ -25,6 +25,11 @@ typedef struct {
     ui2c_lock_key_t (*lock)(ui2c_t* bus);
     void (*unlock)(ui2c_t* bus, ui2c_lock_key_t key);
     ui2c_status_t (*validate)(ui2c_t* bus, ui2c_addr_t addr, const ui2c_msg_t* msgs, size_t count);
+    /* Optional, side-effect-free validation for the prepared transfer shape.
+     * validate() applies only to the ordinary ui2c_xfer path. */
+    ui2c_status_t (*validate_prepared)(ui2c_t* bus, ui2c_addr_t addr,
+                                       const ui2c_msg_t* msgs, size_t count,
+                                       const ui2c_prepare_t* prepare);
     ui2c_status_t (*start)(ui2c_t* bus);
     void (*abort)(ui2c_t* bus);
     void (*process)(ui2c_t* bus);
@@ -51,6 +56,8 @@ struct ui2c {
     const ui2c_msg_t* msgs;
     size_t num_msgs;
     ui2c_addr_t addr;
+    ui2c_prepare_t prepare; /* fn == NULL for ordinary transfers */
+    bool prepare_called;
 
     ui2c_callback_t callback;
     void* callback_arg;
@@ -87,6 +94,12 @@ ui2c_status_t ui2c_port_init(ui2c_t* bus, const ui2c_port_ops_t* ops, void* port
  * @param status
  */
 void ui2c_port_complete(ui2c_t* bus, ui2c_status_t status);
+
+/* Called by the backend exactly once while ACTIVE and while the read/write
+ * combined transaction still owns the bus. Never called from foreground.
+ * The nominated RX is complete; output buffer is exclusively owned by ISR.
+ * A non-OK status must cause backend to abort and complete with that error. */
+ui2c_status_t ui2c_port_prepare(ui2c_t* bus);
 
 /**
  * @brief

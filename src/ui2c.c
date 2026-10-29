@@ -58,46 +58,57 @@ ui2c_status_t ui2c_port_init(ui2c_t* bus, const ui2c_port_ops_t* ops, void* port
     return UI2C_STATUS_OK;
 }
 
-ui2c_status_t ui2c_xfer(ui2c_t* bus, ui2c_addr_t addr, const ui2c_msg_t* msgs, size_t count, ui2c_callback_t callback,
-                        void* arg) {
+static ui2c_status_t submit(ui2c_t* bus, ui2c_addr_t addr, const ui2c_msg_t* msgs, size_t count,
+                            const ui2c_prepare_t* prepare, ui2c_callback_t callback, void* arg) {
     if (bus == NULL || callback == NULL) {
         return UI2C_STATUS_INVALID_ARG;
     }
-
     if (bus->ops == NULL) {
         return UI2C_STATUS_NOT_INITIALIZED;
     }
-
     switch (addr.mode) {
         case UI2C_ADDR_7BIT:
             if (addr.value > 0x7FU) {
                 return UI2C_STATUS_INVALID_ARG;
             }
             break;
-
         case UI2C_ADDR_10BIT:
             if (addr.value > 0x3FFU) {
                 return UI2C_STATUS_INVALID_ARG;
             }
-            if (!(bus->capabilities & UI2C_CAP_ADDR_10BIT)) {
+            if ((bus->capabilities & UI2C_CAP_ADDR_10BIT) == 0U) {
                 return UI2C_STATUS_UNSUPPORTED;
             }
             break;
-
         default: return UI2C_STATUS_INVALID_ARG;
     }
-
     ui2c_status_t status = validate(bus, msgs, count);
-
     if (status != UI2C_STATUS_OK) {
         return status;
     }
-    if (bus->ops->validate != NULL) {
-        status = bus->ops->validate(bus, addr, msgs, count);
-        if (status != UI2C_STATUS_OK) {
-            return status;
+
+    if (prepare != NULL) {
+        if (prepare->fn == NULL || prepare->read_index >= count || prepare->write_index >= count
+            || prepare->read_index >= prepare->write_index) {
+            return UI2C_STATUS_INVALID_ARG;
         }
+        const ui2c_msg_t* rd = &msgs[prepare->read_index];
+        const ui2c_msg_t* wr = &msgs[prepare->write_index];
+        if ((rd->flags & UI2C_MSG_READ) == 0U || (wr->flags & UI2C_MSG_READ) != 0U || rd->len == 0U || wr->len == 0U
+            || wr->data.tx_mutable == NULL || (bus->capabilities & UI2C_CAP_PREPARED_XFER) == 0U
+            || bus->ops->validate_prepared == NULL) {
+            return UI2C_STATUS_UNSUPPORTED;
+        }
+        if (bus->ops->validate_prepared != NULL) {
+            status = bus->ops->validate_prepared(bus, addr, msgs, count, prepare);
+        }
+    } else if (bus->ops->validate != NULL) {
+        status = bus->ops->validate(bus, addr, msgs, count);
     }
+    if (status != UI2C_STATUS_OK) {
+        return status;
+    }
+
     uint32_t now = bus->config.time_ms(bus->config.time_arg);
     ui2c_lock_key_t key = bus->ops->lock(bus);
     if (bus->state != UI2C_IDLE) {
@@ -107,6 +118,8 @@ ui2c_status_t ui2c_xfer(ui2c_t* bus, ui2c_addr_t addr, const ui2c_msg_t* msgs, s
     bus->msgs = msgs;
     bus->num_msgs = count;
     bus->addr = addr;
+    bus->prepare = prepare != NULL ? *prepare : (ui2c_prepare_t){0};
+    bus->prepare_called = false;
     bus->callback = callback;
     bus->callback_arg = arg;
     bus->started_at = now;
@@ -117,11 +130,25 @@ ui2c_status_t ui2c_xfer(ui2c_t* bus, ui2c_addr_t addr, const ui2c_msg_t* msgs, s
         bus->state = UI2C_IDLE;
         bus->msgs = NULL;
         bus->num_msgs = 0U;
+        bus->prepare.fn = NULL;
         bus->callback = NULL;
         bus->callback_arg = NULL;
     }
     bus->ops->unlock(bus, key);
     return status;
+}
+
+ui2c_status_t ui2c_xfer(ui2c_t* bus, ui2c_addr_t addr, const ui2c_msg_t* msgs, size_t count, ui2c_callback_t callback,
+                        void* arg) {
+    return submit(bus, addr, msgs, count, NULL, callback, arg);
+}
+
+ui2c_status_t ui2c_xfer_prepared(ui2c_t* bus, ui2c_addr_t addr, const ui2c_msg_t* msgs, size_t count,
+                                 const ui2c_prepare_t* prepare, ui2c_callback_t callback, void* arg) {
+    if (prepare == NULL) {
+        return UI2C_STATUS_INVALID_ARG;
+    }
+    return submit(bus, addr, msgs, count, prepare, callback, arg);
 }
 
 ui2c_status_t ui2c_cancel(ui2c_t* bus) {
@@ -162,6 +189,8 @@ void ui2c_process(ui2c_t* bus) {
     ui2c_status_t result = bus->result;
     bus->msgs = NULL;
     bus->num_msgs = 0U;
+    bus->prepare.fn = NULL;
+    bus->prepare_called = false;
     bus->callback = NULL;
     bus->callback_arg = NULL;
     bus->state = UI2C_IDLE;
@@ -186,6 +215,16 @@ void ui2c_port_complete(ui2c_t* bus, ui2c_status_t status) {
         bus->result = status;
         bus->state = UI2C_DONE;
     }
+}
+
+ui2c_status_t ui2c_port_prepare(ui2c_t* bus) {
+    if (bus == NULL || bus->state != UI2C_ACTIVE || bus->prepare.fn == NULL || bus->prepare_called) {
+        return UI2C_STATUS_BUS_ERROR;
+    }
+    bus->prepare_called = true; /* Never invoke a failing transform twice. */
+    const ui2c_msg_t* rd = &bus->msgs[bus->prepare.read_index];
+    const ui2c_msg_t* wr = &bus->msgs[bus->prepare.write_index];
+    return bus->prepare.fn(rd->data.rx, rd->len, wr->data.tx_mutable, wr->len, bus->prepare.arg);
 }
 
 ui2c_boundary_t ui2c_port_boundary(const ui2c_t* bus, size_t index) {
